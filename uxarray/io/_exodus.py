@@ -3,9 +3,12 @@ import numpy as np
 from pathlib import PurePath
 from datetime import datetime
 
+from uxarray.utils.helpers import _replace_fill_values
+from uxarray.utils.constants import INT_DTYPE, INT_FILL_VALUE
+
 
 # Exodus Number is one-based.
-def _read_exodus(ext_ds, ds_var_names):
+def _read_exodus(ext_ds, grid_var_names):
     """Exodus file reader.
 
     Parameters: xarray.Dataset, required
@@ -45,7 +48,7 @@ def _read_exodus(ext_ds, ds_var_names):
             # TODO: Use the data here for Mesh2 construct, if required.
             pass
         elif key == "coord":
-            ds.Mesh2.attrs['topology_dimension'] = np.int32(
+            ds.Mesh2.attrs['topology_dimension'] = INT_DTYPE(
                 ext_ds.dims['num_dim'])
             ds["Mesh2_node_x"] = xr.DataArray(
                 data=ext_ds.coord[0],
@@ -108,7 +111,8 @@ def _read_exodus(ext_ds, ds_var_names):
                                dtype=conn.dtype)
                 conn = value.data
             else:
-                raise "found face_nodes_dim greater than nMaxMesh2_face_nodes"
+                raise RuntimeError(
+                    "found face_nodes_dim greater than nMaxMesh2_face_nodes")
 
             # find the elem_type as etype for this element
             for k, v in value.attrs.items():
@@ -118,16 +122,23 @@ def _read_exodus(ext_ds, ds_var_names):
 
     # outside the k,v for loop
     # set the face nodes data compiled in "connect" section
+
+    # standardize fill values and data type face nodes
+    face_nodes = _replace_fill_values(grid_var=conn[:] - 1,
+                                      original_fill=-1,
+                                      new_fill=INT_FILL_VALUE,
+                                      new_dtype=INT_DTYPE)
+
     ds["Mesh2_face_nodes"] = xr.DataArray(
-        data=(conn[:] - 1),
+        data=face_nodes,
         dims=["nMesh2_face", "nMaxMesh2_face_nodes"],
         attrs={
             "cf_role":
                 "face_node_connectivity",
             "_FillValue":
-                -1,
+                INT_FILL_VALUE,
             "start_index":
-                np.int32(
+                INT_DTYPE(
                     0)  # NOTE: This might cause an error if numbering has holes
         })
     print("Finished reading exodus file.")
@@ -141,40 +152,54 @@ def _read_exodus(ext_ds, ds_var_names):
     return ds
 
 
-def _write_exodus(ds, outfile, ds_var_names):
-    """Exodus file writer.
+def _encode_exodus(ds, grid_var_names, outfile=None):
+    """Encodes an Exodus file.
 
     Parameters
     ----------
 
     ds : xarray.Dataset, required
-        Dataset to be written to exodus file.
+        Dataset to be encoded to exodus file.
+
     outfile : string, required
-       Name of output file
+       Name of output file to be added as metadata into the output
+       dataset
+
+    Returns
+    -------
+    exo_ds : xarray.Dataset
+        Dataset encoded as exodus file.
     """
     # Note this is 1-based unlike native Mesh2 construct
-    print("Writing exodus file: ", outfile)
 
     exo_ds = xr.Dataset()
-
-    path = PurePath(outfile)
-    out_filename = path.name
 
     now = datetime.now()
     date = now.strftime("%Y:%m:%d")
     time = now.strftime("%H:%M:%S")
-
-    title = f"uxarray(" + str(out_filename) + ")" + date + ": " + time
-    fp_word = np.int32(8)
+    fp_word = INT_DTYPE(8)
     exo_version = np.float32(5.0)
     api_version = np.float32(5.0)
+
     exo_ds.attrs = {
         "api_version": api_version,
         "version": exo_version,
         "floating_point_word_size": fp_word,
-        "file_size": 0,
-        "title": title
+        "file_size": 0
     }
+
+    if outfile:
+        path = PurePath(outfile)
+        out_filename = path.name
+        title = f"uxarray(" + str(out_filename) + ")" + date + ": " + time
+
+        exo_ds.attrs = {
+            "api_version": api_version,
+            "version": exo_version,
+            "floating_point_word_size": fp_word,
+            "file_size": 0,
+            "title": title
+        }
 
     exo_ds["time_whole"] = xr.DataArray(data=[], dims=["time_step"])
 
@@ -187,32 +212,32 @@ def _write_exodus(ds, outfile, ds_var_names):
                                         dims=["four", "num_qa_rec"])
 
     # get orig dimension from Mesh2 attribute topology dimension
-    dim = ds[ds_var_names["Mesh2"]].topology_dimension
+    dim = ds[grid_var_names["Mesh2"]].topology_dimension
 
     c_data = []
     if dim == 2:
         c_data = xr.DataArray([
-            ds[ds_var_names["Mesh2_node_x"]].data.tolist(),
-            ds[ds_var_names["Mesh2_node_y"]].data.tolist()
+            ds[grid_var_names["Mesh2_node_x"]].data.tolist(),
+            ds[grid_var_names["Mesh2_node_y"]].data.tolist()
         ])
     elif dim == 3:
         c_data = xr.DataArray([
-            ds[ds_var_names["Mesh2_node_x"]].data.tolist(),
-            ds[ds_var_names["Mesh2_node_y"]].data.tolist(),
-            ds[ds_var_names["Mesh2_node_z"]].data.tolist()
+            ds[grid_var_names["Mesh2_node_x"]].data.tolist(),
+            ds[grid_var_names["Mesh2_node_y"]].data.tolist(),
+            ds[grid_var_names["Mesh2_node_z"]].data.tolist()
         ])
 
     exo_ds["coord"] = xr.DataArray(data=c_data, dims=["num_dim", "num_nodes"])
 
     # process face nodes, this array holds num faces at corresponding location
     # eg num_el_all_blks = [0, 0, 6, 12] signifies 6 TRI and 12 SHELL elements
-    num_el_all_blks = np.zeros(ds[ds_var_names["nMaxMesh2_face_nodes"]].size,
-                               "i4")
+    num_el_all_blks = np.zeros(ds[grid_var_names["nMaxMesh2_face_nodes"]].size,
+                               "i8")
     # this list stores connectivity without filling
     conn_nofill = []
 
     # store the number of faces in an array
-    for row in ds[ds_var_names["Mesh2_face_nodes"]].data:
+    for row in ds[grid_var_names["Mesh2_face_nodes"]].astype(INT_DTYPE).data:
 
         # find out -1 in each row, this indicates lower than max face nodes
         arr = np.where(row == -1)
@@ -228,7 +253,7 @@ def _write_exodus(ds, outfile, ds_var_names):
             conn_nofill.append(list_node)
         elif arr[0].size == 0:
             # increment the number of faces for this "nMaxMesh2_face_nodes" face
-            num_el_all_blks[ds[ds_var_names["nMaxMesh2_face_nodes"]].size -
+            num_el_all_blks[ds[grid_var_names["nMaxMesh2_face_nodes"]].size -
                             1] += 1
             # get integer list nodes
             list_node = list(map(int, row.tolist()))
@@ -267,14 +292,15 @@ def _write_exodus(ds, outfile, ds_var_names):
         # assign Data variables
         # convert list to np.array, sorted list guarantees we have the correct info
         conn_blk = conn_nofill[start:start + num_faces]
-        conn_np = np.array([np.array(xi, dtype="i4") for xi in conn_blk])
+        conn_np = np.array([np.array(xi, dtype=INT_DTYPE) for xi in conn_blk])
         exo_ds[str_connect] = xr.DataArray(data=xr.DataArray((conn_np[:] + 1)),
                                            dims=[str_el_in_blk, str_nod_per_el],
                                            attrs={"elem_type": element_type})
 
         # edge type
         exo_ds[str_edge_type] = xr.DataArray(
-            data=xr.DataArray(np.zeros((num_faces, num_nodes), "i4")),
+            data=xr.DataArray(np.zeros((num_faces, num_nodes),
+                                       dtype=INT_DTYPE)),
             dims=[str_el_in_blk, str_nod_per_el])
 
         # global id
@@ -299,7 +325,7 @@ def _write_exodus(ds, outfile, ds_var_names):
                                       attrs={"name": "ID"})
     # eb_status
     exo_ds["eb_status"] = xr.DataArray(data=xr.DataArray(
-        np.ones([num_blks], dtype="i4")),
+        np.ones([num_blks], dtype=INT_DTYPE)),
                                        dims=["num_el_blk"])
 
     # eb_names
@@ -317,9 +343,7 @@ def _write_exodus(ds, outfile, ds_var_names):
         np.array(cnames, dtype='str')),
                                         dims=["num_dim"])
 
-    # done processing write the file to disk
-    exo_ds.to_netcdf(outfile)
-    print("Wrote: ", outfile)
+    return exo_ds
 
 
 def _get_element_type(num_nodes):

@@ -1,7 +1,9 @@
 import xarray as xr
 import numpy as np
 
-from .helpers import grid_center_lat_lon
+from uxarray.utils.helpers import grid_center_lat_lon, _replace_fill_values
+
+from uxarray.utils.constants import INT_DTYPE, INT_FILL_VALUE
 
 
 def _to_ugrid(in_ds, out_ds):
@@ -68,17 +70,23 @@ def _to_ugrid(in_ds, out_ds):
         out_ds['Mesh2_face_x'] = in_ds['grid_center_lon']
         out_ds['Mesh2_face_y'] = in_ds['grid_center_lat']
 
+        # standardize fill values and data type face nodes
+        face_nodes = _replace_fill_values(unq_inv,
+                                          original_fill=-1,
+                                          new_fill=INT_FILL_VALUE,
+                                          new_dtype=INT_DTYPE)
+
         # set the face nodes data compiled in "connect" section
         out_ds["Mesh2_face_nodes"] = xr.DataArray(
-            data=unq_inv,
+            data=face_nodes,
             dims=["nMesh2_face", "nMaxMesh2_face_nodes"],
             attrs={
                 "cf_role":
                     "face_node_connectivity",
                 "_FillValue":
-                    -1,
+                    INT_FILL_VALUE,
                 "start_index":
-                    np.int32(
+                    INT_DTYPE(
                         0
                     )  # NOTE: This might cause an error if numbering has holes
             })
@@ -138,10 +146,9 @@ def _read_scrip(ext_ds):
     return ds
 
 
-def _write_scrip(outfile, mesh2_face_nodes, mesh2_node_x, mesh2_node_y,
-                 face_areas):
+def _encode_scrip(mesh2_face_nodes, mesh2_node_x, mesh2_node_y, face_areas):
     """Function to reassign UGRID formatted variables to SCRIP formatted
-    variables and then writing them out to a netCDF file.
+    variables.
 
     Currently, supports creating unstructured SCRIP grid files following traditional
     SCRIP naming practices (grid_corner_lat, grid_center_lat, etc).
@@ -176,15 +183,14 @@ def _write_scrip(outfile, mesh2_face_nodes, mesh2_node_x, mesh2_node_y,
     Returns
     -------
     ds : xarray.Dataset
-        Dataset to be returned by ``_write_scrip``. The function returns both
-        the output dataset in SCRIP format for immediate and saves it as an
-        independent netCDF file.
+        Dataset to be returned by ``_encode_scrip``. The function returns
+        the output dataset in SCRIP format for immediate use.
     """
     # Create empty dataset to put new scrip format data into
     ds = xr.Dataset()
 
     # Make grid corner lat/lon
-    f_nodes = mesh2_face_nodes.values.ravel()
+    f_nodes = mesh2_face_nodes.values.astype(INT_DTYPE).ravel()
 
     # Create arrays to hold lat/lon data
     lat_nodes = mesh2_node_y[f_nodes].values
@@ -221,8 +227,5 @@ def _write_scrip(outfile, mesh2_face_nodes, mesh2_node_x, mesh2_node_y,
     ds['grid_center_lon'] = xr.DataArray(data=center_lon, dims=["grid_size"])
 
     ds['grid_center_lat'] = xr.DataArray(data=center_lat, dims=["grid_size"])
-
-    # Create and save new scrip file
-    ds.to_netcdf(outfile)
 
     return ds
